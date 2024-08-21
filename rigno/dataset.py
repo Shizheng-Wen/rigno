@@ -64,6 +64,17 @@ NAMES_PE = {'u': ['$u$'], 'c': ['$f$']}
 
 DATASET_METADATA = {
   # incompressible_fluids: [velocity, velocity]
+    'velocity_0': Metadata(
+    periodic=True,
+    data_group='velocity',
+    coeff_group=None,
+    domain_t=(0, 1),
+    domain_x=([0, 0], [1, 1]),
+    active_variables=ACTIVE_VARS_NS,
+    target_variables=TARGET_VARS_NS,
+    signed=SIGNED_NS,
+    names=NAMES_NS,
+  ),
   'incompressible_fluids/brownian_bridge': Metadata(
     periodic=True,
     data_group='velocity',

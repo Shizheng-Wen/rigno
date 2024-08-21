@@ -6,7 +6,7 @@ import jax.random
 import numpy as np
 from flax import linen as nn
 from scipy.spatial import Delaunay
-
+from time import time
 from rigno.graph.typed_graph import (
     TypedGraph, EdgeSet, EdgeSetKey,
     EdgesIndices, NodeSet, Context)
@@ -30,7 +30,8 @@ class RegionInteractionGraphBuilder:
     subsample_factor: float,
     overlap_factor_p2r: float,
     overlap_factor_r2p: float,
-    node_coordinate_freqs: int
+    node_coordinate_freqs: int,
+    mode:str = "fast" # ["debug","fast","slow"]
   ):
 
     # Set attributes
@@ -40,6 +41,8 @@ class RegionInteractionGraphBuilder:
     self.node_coordinate_freqs = node_coordinate_freqs
     self.rmesh_levels = rmesh_levels
     self.subsample_factor = subsample_factor
+    assert mode in ["debug","fast","slow"], f"mode should in `debug`, `fast`, `slow`, got {mode}"
+    self.mode = mode
 
     # Domain shifts for periodic BC
     self._domain_shifts = [
@@ -53,6 +56,9 @@ class RegionInteractionGraphBuilder:
       np.array([[0., -2]]),  # S
       np.array([[-2, -2]]),  # SW
     ]
+
+    if self.mode in ["fast", "debug"]:
+      self._domain_shifts = np.concatenate(self._domain_shifts,0)
 
   def _get_supported_points(self,
     centers: Array,
@@ -105,6 +111,7 @@ class RegionInteractionGraphBuilder:
     # Define node features
     # NOTE: Sinusoidal features don't need normalization
     if self.periodic:
+      # NOTE: no need to optimize here, small loop
       sender_node_feats = np.concatenate([
           np.concatenate([np.sin((k+1) * phi_sen), np.cos((k+1) * phi_sen)], axis=-1)
           for k in range(self.node_coordinate_freqs)
@@ -133,10 +140,22 @@ class RegionInteractionGraphBuilder:
     )
 
     # Define edge features
-    z_ij = np.stack([
-      (x_sen[s] - x_rec[r])
-      for s, r in zip(idx_sen, idx_rec)
-    ], axis=0)
+    if self.mode == "fast":
+      z_ij = x_sen[np.array(idx_sen)] - x_rec[np.array(idx_rec)]
+    elif self.mode == "slow":
+      z_ij = np.stack([
+        (x_sen[s] - x_rec[r])
+        for s, r in zip(idx_sen, idx_rec)
+      ], axis=0)
+    else:
+      z_ij = np.stack([
+        (x_sen[s] - x_rec[r])
+        for s, r in zip(idx_sen, idx_rec)
+      ], axis=0)
+      
+      z_ij_ = x_sen[np.array(idx_sen)] - x_rec[np.array(idx_rec)]
+      np.testing.assert_allclose(z_ij, z_ij_)
+     
     assert np.all(np.abs(z_ij) <= 2.)
     if self.periodic:
       # NOTE: For p2r and r2p, mirror the large relative coordinates
@@ -146,10 +165,21 @@ class RegionInteractionGraphBuilder:
         z_ij = np.where(z_ij >= 1.0, z_ij - 2, z_ij)
       # NOTE: For the r2r multi-mesh, use extended domain indices and shifts
       else:
-        z_ij = np.stack([
+        # NOTE: Need to be further optimized
+        if self.mode == "fast":
+          z_ij = (x_sen[np.array(idx_sen)] + shifts[np.array(np.array(domain_sen))]) - (x_rec[np.array(idx_rec)]+shifts[np.array(domain_rec)])
+        elif self.mode == "slow":
+          z_ij = np.stack([
           ((x_sen[s] + shifts[dom_s]) - (x_rec[r] + shifts[dom_r]))
           for s, r, dom_s, dom_r in zip(idx_sen, idx_rec, domain_sen, domain_rec)
-        ], axis=0)
+          ], axis=0)
+        else:
+          z_ij = np.stack([
+          ((x_sen[s] + shifts[dom_s]) - (x_rec[r] + shifts[dom_r]))
+          for s, r, dom_s, dom_r in zip(idx_sen, idx_rec, domain_sen, domain_rec)
+          ], axis=0)
+          z_ij_ = (x_sen[np.array(idx_sen)] + shifts[np.array(np.array(domain_sen))]) - (x_rec[np.array(idx_rec)]+shifts[np.array(domain_rec)])
+          np.testing.assert_allclose(z_ij, z_ij_)
     d_ij = np.linalg.norm(z_ij, axis=-1, keepdims=True)
     # Normalize and concatenate edge features
     assert np.all(np.abs(z_ij) <= max_edge_length), np.max(np.abs(z_ij))
@@ -172,20 +202,57 @@ class RegionInteractionGraphBuilder:
 
   def _compute_minimum_support_radii(self, x: Array) -> Array:
       if self.periodic:
-        x_extended = np.concatenate(
-          [x + self._domain_shifts[idx] for idx in range(len(self._domain_shifts))], axis=0)
+        if self.mode == "fast":
+          x_extended = (x[None, :, :] + self._domain_shifts[:, None, :]).reshape(-1, 2)
+        elif self.mode == "slow":
+          x_extended = np.concatenate(
+            [x + self._domain_shifts[idx] for idx in range(len(self._domain_shifts))], axis=0)
+        else:
+          x_extended = np.concatenate(
+            [x + self._domain_shifts[None,idx] for idx in range(len(self._domain_shifts))], axis=0)
+          x_extended_ = (x[None, :, :] + self._domain_shifts[:, None, :]).reshape(-1, 2)
+         
+          np.testing.assert_allclose(
+            x_extended,
+            x_extended_
+          )
         tri = Delaunay(points=x_extended)
       else:
         tri = Delaunay(points=x)
 
       medians = _compute_triangulation_medians(tri)
       radii = np.zeros(shape=(x.shape[0],))
-      for s, simplex in enumerate(tri.simplices):
-        for v in range(simplex.shape[0]):
-          if simplex[v] < x.shape[0]:
-            m = medians[s, v]
-            radii[simplex[v]] = max(m, radii[simplex[v]])
-
+      if self.mode == "fast":
+        mask = tri.simplices < x.shape[0] # [N, 3]
+        values = medians[mask]
+        indices  = tri.simplices[mask] 
+        sorted_idx = np.argsort(indices)
+        sorted_indices = indices[sorted_idx]
+        sorted_values  = values[sorted_idx]
+        unique_indices, idx_start = np.unique(sorted_indices, return_index=True)
+        radii[unique_indices] = np.maximum.reduceat(sorted_values,idx_start)
+      elif self.mode == "slow":
+        for s, simplex in enumerate(tri.simplices):
+          for v in range(simplex.shape[0]):
+            if simplex[v] < x.shape[0]:
+              m = medians[s, v]
+              radii[simplex[v]] = max(m, radii[simplex[v]])
+      else:
+        for s, simplex in enumerate(tri.simplices):
+          for v in range(simplex.shape[0]):
+            if simplex[v] < x.shape[0]:
+              m = medians[s, v]
+              radii[simplex[v]] = max(m, radii[simplex[v]])
+        radii_ = np.zeros_like(radii)
+        mask = tri.simplices < x.shape[0] # [N, 3]
+        values = medians[mask]
+        indices  = tri.simplices[mask] 
+        sorted_idx = np.argsort(indices)
+        sorted_indices = indices[sorted_idx]
+        sorted_values  = values[sorted_idx]
+        unique_indices, idx_start = np.unique(sorted_indices, return_index=True)
+        radii_[unique_indices] = np.maximum.reduceat(sorted_values,idx_start)
+        np.testing.assert_allclose(radii, radii_)
       return radii
 
   def _build_p2r_graph(self, x_inp: Array, x_rmesh: Array, r_min: Array) -> TypedGraph:
@@ -227,43 +294,162 @@ class RegionInteractionGraphBuilder:
     radius = self.overlap_factor_p2r * r_min
 
     # Define edges and their corresponding -extended- domain
-    edges = []
-    domains = []
+    if self.mode in ["fast", "debug"]:
+      edges = None 
+      domains = None 
+    else:
+      edges = []
+      domains = []
     for level in range(self.rmesh_levels):
       # Sub-sample the rmesh
       _rmesh_size = int(x_rmesh.shape[0] / (self.subsample_factor ** level))
       _x_rmesh = x_rmesh[:_rmesh_size]
       if self.periodic:
         # Repeat the rmesh in periodic directions
-        _x_rmesh_extended = jnp.concatenate(
+      
+        if self.mode == "fast":
+          _x_rmesh_extended = (_x_rmesh[None, :, :] + self._domain_shifts[:, None, :]).reshape(-1, 2)
+        elif self.mode == "slow":
+          _x_rmesh_extended = jnp.concatenate(
           [_x_rmesh + self._domain_shifts[idx] for idx in range(len(self._domain_shifts))], axis=0)
+        else:
+          _x_rmesh_extended = jnp.concatenate(
+          [_x_rmesh + self._domain_shifts[idx] for idx in range(len(self._domain_shifts))], axis=0)
+          _x_rmesh_extended_ = (_x_rmesh[None, :, :] + self._domain_shifts[:, None, :]).reshape(-1, 2)
+          np.testing.assert_allclose(_x_rmesh_extended, _x_rmesh_extended_)
         tri = Delaunay(points=_x_rmesh_extended)
+
       else:
         tri = Delaunay(points=_x_rmesh)
-      # Construct a triangulation and get the edges
-      _extended_edges = _get_edges_from_triangulation(tri)
-      # Keep the relevant edges
-      for edge in _extended_edges:
-        domain = tuple([i // _rmesh_size for i in edge])
-        edge = tuple([i % _rmesh_size for i in edge])
-        if (domain == (0, 0)) or (self.periodic and (0 in domain)):
-          if edge not in edges:
-            domains.append(domain)
-            edges.append(edge)
 
+      if self.mode == "fast":
+        indptr, cols = tri.vertex_neighbor_vertices
+        rows = np.repeat(np.arange(len(indptr) - 1), np.diff(indptr))
+        assert cols.shape == rows.shape
+        _extended_edges = np.stack([rows, cols], -1) # [e,2]
+        domain = _extended_edges // _rmesh_size # [e,2]
+        edge   = _extended_edges % _rmesh_size # [e,2]
+        is_row_0 = domain[:,0] == 0
+        is_col_0 = domain[:,1] == 0
+        is_all_0 = is_row_0 & is_col_0
+        is_any_0 = is_row_0 | is_col_0 
+        mask     = is_any_0 if self.periodic else is_all_0 # [e]
+        edge     = (edge[:,0] << 32) & edge[:, 1]
+        edge, index = np.unique(edge[mask], axis=0, return_index=True)
+        edge     = np.stack([edge >> 32, edge & 0xFFFFFFFF], -1)
+        domain  = domain[mask][index]
+        try:
+          edges   = edge   if edges   is None else np.concatenate([edges, edge   ], 0)
+          domains = domain if domains is None else np.concatenate([domains, domain], 0)
+        except:
+          breakpoint()
+      elif self.mode == "slow":
+        # Construct a triangulation and get the edges
+        _extended_edges = _get_edges_from_triangulation(tri)
+        # Keep the relevant edges
+        for edge in _extended_edges:
+          domain = tuple([i // _rmesh_size for i in edge])
+          edge = tuple([i % _rmesh_size for i in edge])
+          if (domain == (0, 0)) or (self.periodic and (0 in domain)):
+            if edge not in edges:
+              domains.append(domain)
+              edges.append(edge)
+
+      else:
+        # Construct a triangulation and get the edges
+        _extended_edges = _get_edges_from_triangulation(tri)
+        # Keep the relevant edges
+        start_ptr = 0 if edges is None else len(edges)
+        end_ptr   = 0 if edges is None else len(edges)
+        for edge in _extended_edges:
+          domain = tuple([i // _rmesh_size for i in edge])
+          edge = tuple([i % _rmesh_size for i in edge])
+          if (domain == (0, 0)) or (self.periodic and (0 in domain)):
+            if edges is None or edge not in edges:
+              if domains is None:
+                domains = [domain]
+              else:
+                domains.append(domain)
+              if edges is None:
+                edges = [edge]
+              else:
+                edges.append(edge)
+              end_ptr += 1
+        
+        indptr, cols = tri.vertex_neighbor_vertices
+        rows = np.repeat(np.arange(len(indptr) - 1), np.diff(indptr))
+        assert cols.shape == rows.shape
+        _extended_edges_ = np.stack([rows, cols], -1) # [e,2]
+        domain_ = _extended_edges_ // _rmesh_size # [e,2]
+        edge_   = _extended_edges_ % _rmesh_size # [e,2]
+        is_row_0 = domain_[:,0] == 0
+        is_col_0 = domain_[:,1] == 0
+        is_all_0 = is_row_0 & is_col_0
+        is_any_0 = is_row_0 | is_col_0 
+        mask     = is_any_0 if self.periodic else is_all_0 # [e]
+        
+        edge_ = edge_[:, 0] << 32 | edge_[:, 1]
+        edge_, index = np.unique(edge_[mask], axis=0, return_index=True)
+        edge_ = np.stack([edge_ >> 32, edge_ & 0xFFFFFFFF], -1)
+        domain_ = domain_[mask][index]
+       
+        try:
+          edge   = np.array(edges[start_ptr:end_ptr])
+          domain = np.array(domains[start_ptr:end_ptr])
+          edge_id  = edge[:, 0] << 32 + edge[:, 1]
+          edge_id_ = edge_[:,0] << 32 + edge_[:, 1]
+          domain_id  = domain[:,0] << 32 + domain[:,1]
+          domain_id_ = domain_[:,0] << 32 + domain[:,1] 
+          edge_id  = np.sort(edge_id)
+          edge_id_ = np.sort(edge_id_)
+          domain_id= np.sort(domain_id)
+          domain_id_=np.sort(domain_id_)
+          np.testing.assert_allclose(edge_id,edge_id_)
+          np.testing.assert_allclose(domain_id, domain_id_) 
+        except:
+          breakpoint()
     # Set the initial features
-    edge_set, rmesh_node_set, _ = self._init_structural_features(
+    if self.mode == "fast":
+      edge_set, rmesh_node_set, _ = self._init_structural_features(
       x_sen=x_rmesh,
       x_rec=x_rmesh,
-      idx_sen=[i for (i, j) in edges],
-      idx_rec=[j for (i, j) in edges],
+      idx_sen=edges[:,0],
+      idx_rec=edges[:,1],
       max_edge_length=(2. * jnp.sqrt(x_rmesh.shape[1])),
       feats_sen=radius.reshape(-1, 1),
       feats_rec=radius.reshape(-1, 1),
-      shifts=jnp.array(self._domain_shifts).squeeze(1),
-      domain_sen=[i for (i, j) in domains],
-      domain_rec=[j for (i, j) in domains],
-    )
+      shifts=jnp.array(self._domain_shifts),
+      domain_sen=domains[:,0],
+      domain_rec=domains[:,1],
+      )
+    elif self.mode == "slow":
+      edge_set, rmesh_node_set, _ = self._init_structural_features(
+        x_sen=x_rmesh,
+        x_rec=x_rmesh,
+        idx_sen=[i for (i, j) in edges],
+        idx_rec=[j for (i, j) in edges],
+        max_edge_length=(2. * jnp.sqrt(x_rmesh.shape[1])),
+        feats_sen=radius.reshape(-1, 1),
+        feats_rec=radius.reshape(-1, 1),
+        shifts=jnp.array(self._domain_shifts).squeeze(1),
+        domain_sen=[i for (i, j) in domains],
+        domain_rec=[j for (i, j) in domains],
+      )
+    else:
+      edge_set, rmesh_node_set, _ = self._init_structural_features(
+        x_sen=x_rmesh,
+        x_rec=x_rmesh,
+        idx_sen=[i for (i, j) in edges],
+        idx_rec=[j for (i, j) in edges],
+        max_edge_length=(2. * jnp.sqrt(x_rmesh.shape[1])),
+        feats_sen=radius.reshape(-1, 1),
+        feats_rec=radius.reshape(-1, 1),
+        shifts=jnp.array(self._domain_shifts),
+        domain_sen=[i for (i, j) in domains],
+        domain_rec=[j for (i, j) in domains],
+      )
+    
+      
 
     # Construct the graph
     graph = TypedGraph(
@@ -844,7 +1030,7 @@ def _get_edges_from_triangulation(tri: Delaunay, bidirectional: bool = True):
 def _compute_triangulation_medians(tri: Delaunay) -> Array:
   # Only in 2D
 
-  edges = np.zeros(shape=tri.simplices.shape)
+  edges = np.zeros(shape=tri.simplices.shape) # [N, 3]
   medians = np.zeros(shape=tri.simplices.shape)
   for i in range(tri.simplices.shape[1]):
     points = tri.points[np.delete(tri.simplices, i, axis=1)]

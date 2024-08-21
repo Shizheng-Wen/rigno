@@ -35,11 +35,70 @@ from rigno.utils import disable_logging, Array, shuffle_arrays, split_arrays, is
 
 
 NUM_DEVICES = jax.local_device_count()
-EVAL_FREQ = 50
+EVAL_FREQ = 5
 IDX_FN = 14
 
 FLAGS = flags.FLAGS
-
+def time_graph_build_compare(dataset, hyper = "overlap"):
+  def _plotting(x, y1, y2):
+    import matplotlib.pyplot as plt
+    plt.figure(figsize=(10, 6))
+    plt.plot(x , y1, label = "Mode: Fast", marker="o")
+    plt.plot(x , y2, label = "Mode: Slow", marker="o")
+    plt.xlabel('Overlap Factor')
+    plt.ylabel('Graph Build Time (seconds)')
+    plt.yscale('log')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig("result")
+  # cache warmup
+  builder = RegionInteractionGraphBuilder(
+              periodic=dataset.metadata.periodic,
+              rmesh_levels=FLAGS.rmesh_levels,
+              subsample_factor=FLAGS.mesh_subsample_factor,
+              overlap_factor_p2r=1,
+              overlap_factor_r2p=1,
+              node_coordinate_freqs=FLAGS.node_coordinate_freqs,
+          )
+  graphs = builder.build(
+          x_inp = dataset.sample._x,
+          x_out = dataset.sample._x,
+          domain= np.array(dataset.metadata.domain_x),
+          key=None,
+        )
+  print("finish warmup")
+    
+  if hyper == "overlap":
+    overlap_factors = [1, 2, 3, 4]
+    modes = ["fast", "slow"]
+    times_fast = []
+    times_slow = []
+    for mode in modes:
+      for overlap_factor in overlap_factors:
+        builder = RegionInteractionGraphBuilder(
+              periodic=dataset.metadata.periodic,
+              rmesh_levels=FLAGS.rmesh_levels,
+              subsample_factor=FLAGS.mesh_subsample_factor,
+              overlap_factor_p2r=overlap_factor,
+              overlap_factor_r2p=overlap_factor,
+              node_coordinate_freqs=FLAGS.node_coordinate_freqs,
+              mode=mode
+          )
+        print(f"Testing mode: {mode}, overlap_factor_p2r: {overlap_factor}")
+        start_time = time()
+        graphs = builder.build(
+          x_inp = dataset.sample._x,
+          x_out = dataset.sample._x,
+          domain= np.array(dataset.metadata.domain_x),
+          key=None,
+        )
+        build_time = time() - start_time
+        if mode == "fast":
+          times_fast.append(build_time)
+        else:
+          times_slow.append(build_time)
+    _plotting(overlap_factors,times_fast,times_slow)
+      
 def define_flags():
   # FLAGS::general
   flags.DEFINE_string(name='exp', default='000', required=False,
@@ -194,8 +253,9 @@ def train(
     raise ValueError
   if dataset.time_dependent:
     autoregressive = AutoregressiveStepper(stepper=stepper, dt=dataset.dt)
-
   # Define the graph builder
+  time_graph_build_compare(dataset,"overlap")
+  breakpoint()
   builder = RegionInteractionGraphBuilder(
     periodic=dataset.metadata.periodic,
     rmesh_levels=FLAGS.rmesh_levels,
@@ -204,7 +264,8 @@ def train(
     overlap_factor_r2p=FLAGS.overlap_factor_r2p,
     node_coordinate_freqs=FLAGS.node_coordinate_freqs,
   )
-
+  print("start_graph_build")
+  time_original = time()
   # Construct the graphs
   # NOTE: Assuming fix mesh for all batches
   graphs = builder.build(
@@ -213,7 +274,7 @@ def train(
     domain=np.array(dataset.metadata.domain_x),
     key=None,
   )
-
+  print(f"after graph builder, it takes {time() - time_original}")
   # Set the normalization statistics
   stats = {
     key: {
@@ -994,7 +1055,8 @@ def main(argv):
     assert FLAGS.tau_max == 0
     assert FLAGS.fractional is False
     dataset.compute_stats()
-
+  time_graph_build_compare(dataset,"overlap")
+  breakpoint()
   # Read the checkpoint
   if FLAGS.params:
     DIR_OLD_EXPERIMENT = DIR_EXPERIMENTS / FLAGS.params
@@ -1049,11 +1111,15 @@ def main(argv):
       overlap_factor_r2p=.01,
       node_coordinate_freqs=FLAGS.node_coordinate_freqs,
     )
+    print("start_dummy_graph_build")
+    time_dummy = time()
     dummy_graphs = dummy_graph_builder.build(
       x_inp=dataset.sample._x,
       x_out=dataset.sample._x,
       domain=np.array(dataset.metadata.domain_x),
     )
+    print(f"finish_dummy_graph_build,it takes {time() - time_dummy}")
+    # exit()
     if dataset.time_dependent:
       dummy_inputs = Inputs(
         u=jnp.ones(shape=(FLAGS.batch_size, 1, *dataset.sample.u.shape[2:])),
